@@ -1,24 +1,15 @@
-
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
+from typing import Dict, Set, Any
+from collections import defaultdict
 import os
 import json
-import uuid
-from typing import Dict, Set
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, FileResponse
-from starlette.staticfiles import StaticFiles
 
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
-STATIC_DIR = os.path.join(APP_DIR, "static")
+app = FastAPI(title="MES", version="1.0.0")
 
-app = FastAPI(title="MES WebRTC")
-
-origins = [
-    "https://ameba1399.github.io",
-    "https://mes.koyeb.app",
-]
-
-# CORS (tune in production)
+# CORS (на случай фронта с другого домена)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -27,112 +18,109 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Serve static UI
-app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+static_dir = os.path.join(os.path.dirname(__file__), "static")
+os.makedirs(static_dir, exist_ok=True)
+app.mount("/static", StaticFiles(directory=static_dir), name="static")
+
+rooms: Dict[str, Set[WebSocket]] = defaultdict(set)
+user_meta: Dict[WebSocket, Dict[str, Any]] = {}
 
 @app.get("/", response_class=HTMLResponse)
 async def root():
-    # Serve index.html
-    return FileResponse(os.path.join(STATIC_DIR, "index.html"))
+    return FileResponse(os.path.join(static_dir, "index.html"))
 
-# ---- Simple in-memory room manager ----
-class RoomManager:
-    def __init__(self):
-        # room_id -> { user_id: websocket }
-        self.rooms: Dict[str, Dict[str, WebSocket]] = {}
+@app.get("/call", response_class=HTMLResponse)
+async def call():
+    return FileResponse(os.path.join(static_dir, "call.html"))
 
-    def room_users(self, room_id: str):
-        return self.rooms.get(room_id, {})
+async def broadcast(room: str, payload: dict, except_ws: WebSocket | None = None):
+    dead = []
+    for ws in rooms[room]:
+        if ws is except_ws:
+            continue
+        try:
+            await ws.send_text(json.dumps(payload, ensure_ascii=False))
+        except Exception:
+            dead.append(ws)
+    for ws in dead:
+        rooms[room].discard(ws)
+        user_meta.pop(ws, None)
 
-    async def connect(self, room_id: str, user_id: str, ws: WebSocket):
-        await ws.accept()
-        if room_id not in self.rooms:
-            self.rooms[room_id] = {}
-        self.rooms[room_id][user_id] = ws
-
-    def disconnect(self, room_id: str, user_id: str):
-        if room_id in self.rooms and user_id in self.rooms[room_id]:
-            del self.rooms[room_id][user_id]
-            if not self.rooms[room_id]:
-                del self.rooms[room_id]
-
-    async def broadcast(self, room_id: str, message: dict, exclude: Set[str] | None = None):
-        exclude = exclude or set()
-        users = dict(self.room_users(room_id))
-        for uid, ws in users.items():
-            if uid in exclude:
-                continue
-            try:
-                await ws.send_text(json.dumps(message))
-            except Exception:
-                # ignore send errors
-                pass
-
-manager = RoomManager()
-
-@app.websocket("/ws")
-async def websocket_endpoint(ws: WebSocket):
-    # Expect ?room=ROOM&user=NAME
-    params = ws.query_params
-    room_id = params.get("room") or "default"
-    display_name = params.get("user") or "guest"
-    user_id = str(uuid.uuid4())
-
-    await manager.connect(room_id, user_id, ws)
-
-    # Notify others about join
-    await manager.broadcast(
-        room_id,
-        {"type": "peer-join", "userId": user_id, "name": display_name},
-        exclude={user_id},
-    )
-
-    # Send initial state (who's already in the room)
-    existing = [
-        {"userId": uid, "name": f"peer-{uid[:4]}"}
-        for uid in manager.room_users(room_id).keys()
-        if uid != user_id
-    ]
-    await ws.send_text(json.dumps({"type": "room-state", "peers": existing, "selfId": user_id, "name": display_name}))
-
+@app.websocket("/ws/{room}")
+async def ws_endpoint(websocket: WebSocket, room: str):
+    await websocket.accept()
+    rooms[room].add(websocket)
     try:
         while True:
-            raw = await ws.receive_text()
-            data = json.loads(raw)
+            msg = await websocket.receive_text()
+            data = json.loads(msg)
+            mt = data.get("type")
 
-            # Relay signaling messages to specific peer(s)
-            if data.get("type") in {"webrtc-offer", "webrtc-answer", "webrtc-ice"}:
-                target = data.get("target")
-                if target:
-                    target_ws = manager.room_users(room_id).get(target)
-                    if target_ws:
-                        payload = data | {"from": user_id}
-                        await target_ws.send_text(json.dumps(payload))
+            # Запоминаем мету пользователя при join
+            if mt == "join":
+                user_meta[websocket] = {
+                    "id": data["id"],
+                    "name": data.get("name", "guest"),
+                    "room": room,
+                }
+                # Отправляем список участников
+                participants = [
+                    {"id": user_meta[w]["id"], "name": user_meta[w]["name"]}
+                    for w in rooms[room]
+                    if w in user_meta
+                ]
+                await websocket.send_text(json.dumps({
+                    "type": "participants",
+                    "participants": participants
+                }, ensure_ascii=False))
 
-            # Chat messages broadcast
-            elif data.get("type") == "chat-message":
-                await manager.broadcast(room_id, {
-                    "type": "chat-message",
-                    "from": user_id,
-                    "name": display_name,
+                # Оповещение остальных
+                await broadcast(room, {
+                    "type": "presence",
+                    "action": "join",
+                    "id": data["id"],
+                    "name": data.get("name", "guest")
+                }, except_ws=websocket)
+
+            elif mt == "chat":
+                await broadcast(room, {
+                    "type": "chat",
+                    "id": data["id"],
+                    "name": data.get("name", "guest"),
                     "text": data.get("text", "")
                 })
 
-            # Control messages (mute/cam/etc) just rebroadcast
-            elif data.get("type") == "control":
-                await manager.broadcast(room_id, data | {"from": user_id}, exclude={user_id})
+            elif mt == "signal":
+                # перекидываем сигнал конкретному получателю
+                target_id = data.get("target")
+                # находим websocket по айди
+                target_ws = None
+                for w in rooms[room]:
+                    meta = user_meta.get(w)
+                    if meta and meta["id"] == target_id:
+                        target_ws = w
+                        break
+                if target_ws:
+                    await target_ws.send_text(json.dumps({
+                        "type": "signal",
+                        "from": data.get("from"),
+                        "signal": data.get("signal")
+                    }))
 
-            # Request current peers list
-            elif data.get("type") == "get-peers":
-                peers = [
-                    {"userId": uid, "name": f"peer-{uid[:4]}"}
-                    for uid in manager.room_users(room_id).keys()
-                    if uid != user_id
-                ]
-                await ws.send_text(json.dumps({"type": "room-state", "peers": peers, "selfId": user_id}))
+            elif mt == "ping":
+                await websocket.send_text(json.dumps({"type": "pong"}))
 
     except WebSocketDisconnect:
         pass
     finally:
-        manager.disconnect(room_id, user_id)
-        await manager.broadcast(room_id, {"type": "peer-leave", "userId": user_id})
+        # при отключении
+        meta = user_meta.get(websocket)
+        rooms[room].discard(websocket)
+        user_meta.pop(websocket, None)
+        if meta:
+            await broadcast(room, {
+                "type": "presence",
+                "action": "leave",
+                "id": meta["id"],
+                "name": meta["name"]
+            })
