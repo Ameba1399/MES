@@ -13,6 +13,11 @@ STATIC_DIR = os.path.join(APP_DIR, "static")
 
 app = FastAPI(title="MES WebRTC")
 
+origins = [
+    "https://ameba1399.github.io",
+    "https://mes.koyeb.app",
+]
+
 # CORS (tune in production)
 app.add_middleware(
     CORSMiddleware,
